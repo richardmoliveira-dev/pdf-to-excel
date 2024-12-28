@@ -1,102 +1,149 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
 
 
-from flask import Flask, request, send_file
+
 import fitz  # PyMuPDF
 import re
 import pandas as pd
 from io import BytesIO
-from openpyxl import Workbook
 import os
+from flask import Flask, request, send_file, jsonify
 
 app = Flask(__name__)
 
-# Função para extrair informações do PDF
+# Diretório para uploads temporários
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 def extract_info_from_pdf(pdf_path):
     try:
         pdf_document = fitz.open(pdf_path)
-        all_beneficiarios = []
-
+        all_text = ""
         for page_number in range(len(pdf_document)):
             page = pdf_document.load_page(page_number)
-            text = page.get_text("text")
-            beneficiarios_pagina = extract_info_from_text(text)
-            all_beneficiarios.extend(beneficiarios_pagina)
+            all_text += page.get_text("text") + "\n"
 
         pdf_document.close()
+
+        lines = all_text.splitlines()
+        lines_sem_branco = [l for l in lines if l.strip() != '']
+        all_text = "\n".join(lines_sem_branco)
+
+        all_beneficiarios = extract_info_from_text(all_text)
         return all_beneficiarios
+
     except Exception as e:
         print(f"Erro ao extrair informações do PDF: {str(e)}")
         return []
 
-# Função para extrair informações do texto
 def extract_info_from_text(text):
-    padrao_numero_guia = r"71 - Nome Social do Beneficiário\n(\d{9})"
-    padrao_nome_beneficiario = r"21 - Nome do Beneficiário\n(.+)"
-    padrao_valor_guia = r"40 - Valor Total Liberado Guia \(R\$\)\n([\d,]+)"
+    pattern = re.compile(
+        r"71 - Nome Social do Beneficiário\n(?P<numero_guia>\d{9})|"
+        r"9\d{8}-00\d\r?\n(?P<dentista>.+)|"
+        r"21 - Nome do Beneficiário\n(?P<nome_beneficiario>.+)|"
+        r"40 - Valor Total Liberado Guia \(R\$\)\n(?P<valor_guia>[\d.,]+)"
+    )
 
-    matches = re.finditer(f"{padrao_numero_guia}|{padrao_nome_beneficiario}|{padrao_valor_guia}", text)
-    beneficiarios_pagina = []
+    beneficiarios = []
     info_beneficiario = {}
 
-    for match in matches:
-        if match.group(1):
+    for match in pattern.finditer(text):
+        if match.lastgroup == "numero_guia":
             if info_beneficiario:
-                beneficiarios_pagina.append(info_beneficiario.copy())
+                beneficiarios.append(info_beneficiario.copy())
                 info_beneficiario.clear()
-            info_beneficiario['numero_guia'] = int(match.group(1))
-        elif match.group(2):
-            info_beneficiario['nome_beneficiario'] = match.group(2)
-        elif match.group(3):
-            info_beneficiario['valor_guia'] = match.group(3)
+            info_beneficiario['numero_guia'] = match.group("numero_guia")
+
+        elif match.lastgroup == "dentista":
+            info_beneficiario['dentista'] = match.group("dentista")
+
+        elif match.lastgroup == "nome_beneficiario":
+            info_beneficiario['nome_beneficiario'] = match.group("nome_beneficiario")
+
+        elif match.lastgroup == "valor_guia":
+            info_beneficiario['valor_guia'] = match.group("valor_guia")
 
     if info_beneficiario:
-        beneficiarios_pagina.append(info_beneficiario)
+        beneficiarios.append(info_beneficiario)
 
-    return beneficiarios_pagina
+    return beneficiarios
 
-# Rota da API para processar o PDF
 @app.route('/process_pdf', methods=['POST'])
 def process_pdf():
     if 'file' not in request.files:
-        return "Nenhum arquivo enviado", 400
+        return jsonify({"error": "Nenhum arquivo enviado"}), 400
 
-    uploaded_file = request.files['file']
-    pdf_path = f"uploads/{uploaded_file.filename}"
+    file = request.files['file']
+    if not file.filename.endswith('.pdf'):
+        return jsonify({"error": "Arquivo inválido. Apenas PDFs são aceitos"}), 400
 
-    os.makedirs("uploads", exist_ok=True)
-    uploaded_file.save(pdf_path)
+    temp_pdf_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(temp_pdf_path)
 
-    # Processar o PDF e criar o Excel
-    beneficiarios = extract_info_from_pdf(pdf_path)
-    if not beneficiarios:
-        return "Erro ao processar o PDF ou PDF vazio", 500
+    try:
+        todos_beneficiarios = extract_info_from_pdf(temp_pdf_path)
 
-    excel_bytes = BytesIO()
-    wb = Workbook()
-    ws = wb.active
+        # Processa os dados e gera o Excel
+        linhas_detalhadas = []
+        for benef in todos_beneficiarios:
+            numero = benef.get('numero_guia', '')
+            dentista = benef.get('dentista', '')
+            nome_ben = benef.get('nome_beneficiario', '')
+            valor_str = benef.get('valor_guia', '').strip()
 
-    ws.append(["Número da Guia", "Nome do Beneficiário", "Valor da Guia"])
-    for beneficiario in beneficiarios:
-        ws.append([
-            beneficiario.get('numero_guia', ''),
-            beneficiario.get('nome_beneficiario', ''),
-            beneficiario.get('valor_guia', '')
-        ])
+            valor_num = None
+            if valor_str:
+                valor_sem_pontos = valor_str.replace('.', '')
+                valor_convertido = valor_sem_pontos.replace(',', '.')
+                try:
+                    valor_num = float(valor_convertido)
+                except ValueError:
+                    valor_num = None
 
-    wb.save(excel_bytes)
-    excel_bytes.seek(0)
+            linhas_detalhadas.append({
+                "Número da Guia": numero,
+                "Dentista": dentista,
+                "Nome do Beneficiário": nome_ben,
+                "Valor da Guia": valor_num
+            })
 
-    return send_file(
-        excel_bytes,
-        as_attachment=True,
-        download_name=uploaded_file.filename.replace('.pdf', '_informacoes_beneficiarios.xlsx'),
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
+        df_detalhado = pd.DataFrame(linhas_detalhadas)
 
-if __name__ == '__main__':
+        df_detalhado_agrupado = df_detalhado.groupby("Número da Guia", as_index=False).agg({
+            "Dentista": "first",
+            "Nome do Beneficiário": "first",
+            "Valor da Guia": "sum"
+        })
+
+        df_resumo = df_detalhado_agrupado.groupby('Dentista', as_index=False, dropna=False).agg(
+            quant_guias=('Número da Guia', 'count'),
+            total_guias=('Valor da Guia', 'sum')
+        )
+
+        qtd_guias_geral = df_resumo['quant_guias'].sum()
+        total_guias_geral = df_resumo['total_guias'].sum()
+
+        df_total = pd.DataFrame({
+            'Dentista': ['TOTAL GERAL'],
+            'quant_guias': [qtd_guias_geral],
+            'total_guias': [total_guias_geral]
+        })
+        df_resumo = pd.concat([df_resumo, df_total], ignore_index=True)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output) as writer:
+            df_detalhado_agrupado.to_excel(writer, sheet_name='Detalhado', index=False)
+            df_resumo.to_excel(writer, sheet_name='Resumo por Dentista', index=False)
+
+        output.seek(0)
+        os.remove(temp_pdf_path)  # Remove o PDF temporário
+        return send_file(output, as_attachment=True, download_name='resultado.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    except Exception as e:
+        os.remove(temp_pdf_path)  # Remove o PDF temporário em caso de erro
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
     app.run(debug=True)
-
